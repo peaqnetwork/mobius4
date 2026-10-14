@@ -41,6 +41,7 @@ function buildNodeConfig({ env, bool, number }, adminIdentity) {
             sp_id: env('CSE_SP_ID'),
             csebase_rn: env('CSE_BASE_RN'),
             poa: env('CSE_POA') ? [env('CSE_POA')] : undefined,
+            subscription_verification: bool('SUBSCRIPTION_VERIFICATION'),
             // The CSE this one registers with, read by cse/registree.js. The whole block was
             // missing, and because this script overwrites NODE_CONFIG it could not be injected from
             // outside either — so a containerised MN-CSE had no way to reach its registrar

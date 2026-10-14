@@ -547,7 +547,6 @@ async function mqtt_noti(noti_target, sgn, to_override) {
 //     indistinguishable from "could not be sent".
 async function send_verification(target, creator, sub_sid, timeout_ms) {
   const { get_to_info } = require('./reqPrim');
-  const { generate_ri } = require('./utils');
 
   const { shortest_to: res_id } = get_to_info({ to: target });
   const urls = res_id ? await get_urls_from_poa(res_id) : [];
@@ -560,6 +559,17 @@ async function send_verification(target, creator, sub_sid, timeout_ms) {
   const { to_path_component } = require('./reqPrim');
   const url = poa.replace(/\/+$/, '') + to_path_component(target);
 
+  return send_verification_request(target, url, creator, sub_sid, timeout_ms);
+}
+
+// An HTTP(S) notificationURI already names the endpoint, including its path and query.
+// Use the same verification primitive as resource-ID targets, without a pointOfAccess lookup.
+async function send_verification_url(url, creator, sub_sid, timeout_ms) {
+  return send_verification_request(url, url, creator, sub_sid, timeout_ms);
+}
+
+async function send_verification_request(target, url, creator, sub_sid, timeout_ms) {
+  const { generate_ri } = require('./utils');
   const rqi = 'verif-noti-' + generate_ri();
   logger.debug({
       prim: { to: target, fr: config.cse.cse_id, rqi, rvi: config.cse.versions[0], op: 5,
@@ -689,4 +699,5 @@ module.exports = {
     // Used by cse/subscription-verification.js's verify_targets, on the subscription creation
     // path (cse/resources/sub.js).
     send_verification,
+    send_verification_url,
 };

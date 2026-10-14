@@ -1,21 +1,26 @@
 "use strict";
-// TS-0004:7.4.8.2.1 Recv-6.4 scopes verification to notificationURI entries that "are not the
-// Originator and are formatted as oneM2M-compliant resource-IDs". TS-0001:9.6.8 defines that
-// format as a structured or unstructured CSE-Relative-, SP-Relative-, or Absolute-Resource-ID
-// "of an <AE> or <CSEBase> resource" -- as opposed to a protocol-binding URL. So the axis is
-// resource-ID versus URL, and both halves have to be pinned: a URL that gets verified would
-// break every existing deployment, and a resource-ID that does not would make the feature inert.
+// Verification covers HTTP(S) notification URLs and resource IDs other than the Originator.
+// The setting remains off by default; enabled deployments require OK from every target.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const { is_resource_id_target, verification_targets } = require("../cse/subscription-verification");
+const { is_resource_id_target, is_url_target, verification_targets } = require("../cse/subscription-verification");
 
-test("a protocol-binding URL is not a verification target", () => {
+test("a protocol-binding URL is not a resource-ID target", () => {
   // coap:// is deliberately absent from this list. The standard names coap as a binding, but
   // mobius4 has none and cse/noti.js does not exclude it, so a coap:// entry is a resource-ID to
   // the code that actually sends notifications. Calling it a URL here would split the two rules.
   // See "the URL rule is the one cse/noti.js applies" below, which pins the whole correspondence.
   for (const url of ["http://host/notify", "https://host/notify", "mqtt://broker/x"]) {
     assert.equal(is_resource_id_target(url), false, url);
+  }
+});
+
+test("only HTTP(S) URLs use direct verification", () => {
+  for (const url of ["http://host/notify", "https://host/notify?key=value"]) {
+    assert.equal(is_url_target(url), true, url);
+  }
+  for (const target of ["mqtt://broker/x", "Mobius/ae1", "httpSink", "http:bad", null, 123]) {
+    assert.equal(is_url_target(target), false, String(target));
   }
 });
 
@@ -32,9 +37,17 @@ test("the Originator's own entry is excluded", async () => {
   assert.deepEqual(got, ["/CSE1/AE2"]);
 });
 
-test("URLs and the Originator are filtered together", async () => {
-  const got = await verification_targets(["http://h/n", "/CSE1/AE1", "/CSE1/AE2"], "/CSE1/AE1");
-  assert.deepEqual(got, ["/CSE1/AE2"]);
+test("HTTP(S) URLs join resource-ID targets while the Originator and MQTT are excluded", async () => {
+  const got = await verification_targets(
+    ["http://h/n", "/CSE1/AE1", "/CSE1/AE2", "mqtt://broker/x", "https://h/n"], "/CSE1/AE1");
+  assert.deepEqual(got, ["http://h/n", "/CSE1/AE2", "https://h/n"]);
+});
+
+test("URL-only target selection does not need resource lookup", async () => {
+  assert.deepEqual(await verification_targets(["http://h/n", "https://h/n"], "Csubscriber"),
+    ["http://h/n", "https://h/n"]);
+  assert.deepEqual(await verification_targets(["mqtt://broker/x"], "Csubscriber"), []);
+  assert.deepEqual(await verification_targets(undefined, "Csubscriber"), []);
 });
 
 test("the response status codes are the values the standard assigns", () => {
@@ -49,6 +62,34 @@ test("the response status codes are the values the standard assigns", () => {
 test("verification is off unless a deployment turns it on", () => {
   const { verification_enabled } = require("../cse/subscription-verification");
   assert.equal(verification_enabled(), false, "config/default.json must ship it disabled");
+});
+
+test("SUBSCRIPTION_VERIFICATION=true enables verification without a local configuration file", () => {
+  const { spawnSync } = require("node:child_process");
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const repoRoot = path.resolve(__dirname, "..");
+  const bareConfig = fs.mkdtempSync(path.join(os.tmpdir(), "mobius4-verification-config-"));
+  fs.copyFileSync(path.join(repoRoot, "config", "default.json"), path.join(bareConfig, "default.json"));
+  try {
+    for (const [setting, flag, expected] of [
+      [false, "true", true], [false, "false", false], [false, "1", false], [false, "", false],
+      [true, "false", true],
+    ]) {
+      const r = spawnSync(process.execPath, ["-e",
+        "process.stdout.write(String(require('./cse/subscription-verification').verification_enabled()))"], {
+        cwd: repoRoot, encoding: "utf8",
+        env: { ...process.env, NODE_ENV: "production", NODE_CONFIG_DIR: bareConfig,
+          NODE_CONFIG: JSON.stringify({ cse: { subscription_verification: setting } }),
+          SUBSCRIPTION_VERIFICATION: flag },
+      });
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.stdout, String(expected), `setting=${setting}, flag=${flag}`);
+    }
+  } finally {
+    fs.rmSync(bareConfig, { recursive: true, force: true });
+  }
 });
 
 test("the Originator is excluded however it is spelled", async () => {
@@ -240,7 +281,7 @@ test("a verification request whose creator and Originator both hold NOTIFY is ac
 test("verification is skipped entirely when the setting is off", async () => {
   // The default. A URL-only deployment must be untouched, and so must a resource-ID one.
   const { verify_targets } = require("../cse/subscription-verification");
-  assert.equal(await verify_targets(["/CSE1/AE1"], "/CSE1/AE9"), null);
+  assert.equal(await verify_targets(["/CSE1/AE1", "http://unreachable.invalid/n"], "/CSE1/AE9"), null);
 });
 
 // The four tests below exercise the whole path -- CREATE <subscription> over HTTP, through
@@ -254,26 +295,29 @@ test("verification is skipped entirely when the setting is off", async () => {
 // always answers 2000 -- it exists to prove notifications *arrive*, not to test the CSE's
 // reaction to a target's refusal -- so it cannot exercise "the target refuses verification" on
 // its own.
-async function startRscSink(rsc) {
+async function startRscSink(rsc, { statusCode = 200, reply = true, tls } = {}) {
   const http = require("node:http");
   const received = [];
-  const server = http.createServer((req, res) => {
+  const handler = (req, res) => {
     let raw = "";
     req.on("data", (c) => { raw += c; });
     req.on("end", () => {
       let parsed = null;
       try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = null; }
-      received.push({ headers: req.headers, body: parsed });
-      res.writeHead(200, { "X-M2M-RSC": String(rsc), "Content-Type": "application/json" });
+      received.push({ url: req.url, method: req.method, headers: req.headers, body: parsed });
+      if (!reply) return;
+      res.writeHead(statusCode, { ...(rsc === undefined ? {} : { "X-M2M-RSC": String(rsc) }),
+        "Content-Type": "application/json" });
       res.end("{}");
     });
-  });
+  };
+  const server = tls ? require("node:https").createServer(tls, handler) : http.createServer(handler);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   return {
-    url: `http://127.0.0.1:${port}/noti`,
+    url: `${tls ? "https" : "http"}://127.0.0.1:${port}/noti`,
     received,
-    stop: () => new Promise((resolve) => server.close(resolve)),
+    stop: () => new Promise((resolve) => { server.close(resolve); server.closeAllConnections(); }),
   };
 }
 
@@ -422,6 +466,175 @@ test("on: the target refuses the verification NOTIFY (4103), the creation is ref
     assert.equal(rscSink.received.length, 1, "the verification NOTIFY must have reached the target");
   } finally {
     await rscSink.stop();
+    await srv.stop();
+  }
+});
+
+for (const viaEnv of [false, true]) {
+  test(`an HTTP URL is verified before creation with ${viaEnv ? "the environment flag" : "the configuration setting"}`, async () => {
+    const { startServer } = require("./helpers/server");
+    const { startSink } = require("./helpers/noti-sink");
+    const { create, CSE_BASE, ADMIN, uniqueRn } = require("./helpers/onem2m");
+    const config = require("config");
+    const previous = process.env.SUBSCRIPTION_VERIFICATION;
+    let srv;
+    try {
+      if (viaEnv) process.env.SUBSCRIPTION_VERIFICATION = "true";
+      srv = await startServer({ cse: { subscription_verification: !viaEnv } });
+    } finally {
+      if (previous === undefined) delete process.env.SUBSCRIPTION_VERIFICATION;
+      else process.env.SUBSCRIPTION_VERIFICATION = previous;
+    }
+    const sink = await startSink();
+    try {
+      const cntSid = `${CSE_BASE}/${uniqueRn("c")}`;
+      const madeCnt = await create(srv.baseUrl, CSE_BASE, 3, { "m2m:cnt": { rn: cntSid.split("/").pop() } });
+      assert.equal(madeCnt.rsc, "2001", madeCnt.raw);
+      const subSid = `${cntSid}/${uniqueRn("s")}`;
+      const callbackUrl = `${sink.url}/callback?token=verification`;
+      const madeSub = await create(srv.baseUrl, cntSid, 23, { "m2m:sub": {
+        rn: subSid.split("/").pop(), et: "20990101T000000", nu: [callbackUrl],
+        enc: { net: [3], chty: [4] }, nct: 1,
+      } });
+      assert.equal(madeSub.rsc, "2001", madeSub.raw);
+      assert.deepEqual(madeSub.body["m2m:sub"].nu, [callbackUrl]);
+      const verif = sink.received.find((item) => item.body?.["m2m:sgn"]?.vrq === true);
+      assert.ok(verif, "verification must arrive before CREATE returns");
+      assert.equal(verif.method, "POST");
+      assert.equal(verif.url, "/noti/callback?token=verification", "use the URL path and query verbatim");
+      assert.deepEqual(verif.body, { "m2m:sgn": { vrq: true, cr: ADMIN, sur: subSid } });
+      assert.equal(verif.headers["x-m2m-origin"], config.cse.cse_id);
+      assert.equal(verif.headers["x-m2m-rvi"], config.cse.versions[0]);
+      assert.match(verif.headers["x-m2m-ri"], /^verif-noti-[A-Za-z0-9._:-]+$/);
+      assert.equal(verif.headers["content-type"], "application/json");
+
+      const madeCin = await create(srv.baseUrl, cntSid, 4, { "m2m:cin": { con: "42" } });
+      assert.equal(madeCin.rsc, "2001", madeCin.raw);
+      const notification = await sink.waitFor((item) => item.body?.["m2m:sgn"]?.nev?.net === 3);
+      assert.equal(notification.body["m2m:sgn"].sur, subSid);
+      assert.equal(notification.body["m2m:sgn"].nev.rep["m2m:cin"].ri, madeCin.body["m2m:cin"].ri);
+    } finally {
+      await sink.stop();
+      await srv.stop();
+    }
+  });
+}
+
+test("an HTTPS URL receives verification over a trusted TLS connection", async (t) => {
+  const { spawnSync } = require("node:child_process");
+  if (spawnSync("openssl", ["version"]).status !== 0) return t.skip("openssl not available");
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { startServer } = require("./helpers/server");
+  const { create, CSE_BASE, ADMIN, uniqueRn } = require("./helpers/onem2m");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mobius4-verification-tls-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const key = path.join(dir, "server.key");
+  const cert = path.join(dir, "server.crt");
+  const result = spawnSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-sha256",
+    "-days", "1", "-nodes", "-keyout", key, "-out", cert,
+    "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1"], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const sink = await startRscSink(2000, { tls: { key: fs.readFileSync(key), cert: fs.readFileSync(cert) } });
+  t.after(() => sink.stop());
+  const previous = process.env.NODE_EXTRA_CA_CERTS;
+  let srv;
+  try {
+    process.env.NODE_EXTRA_CA_CERTS = cert;
+    srv = await startServer({ cse: { subscription_verification: true } });
+  } finally {
+    if (previous === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+    else process.env.NODE_EXTRA_CA_CERTS = previous;
+  }
+  t.after(() => srv.stop());
+  const cntSid = `${CSE_BASE}/${uniqueRn("c")}`;
+  const madeCnt = await create(srv.baseUrl, CSE_BASE, 3, { "m2m:cnt": { rn: cntSid.split("/").pop() } });
+  assert.equal(madeCnt.rsc, "2001", madeCnt.raw);
+  const subSid = `${cntSid}/${uniqueRn("s")}`;
+  const madeSub = await create(srv.baseUrl, cntSid, 23, { "m2m:sub": {
+    rn: subSid.split("/").pop(), nu: [sink.url], enc: { net: [3] }, nct: 1,
+  } });
+  assert.equal(madeSub.rsc, "2001", madeSub.raw);
+  assert.equal(sink.received.length, 1);
+  assert.deepEqual(sink.received[0].body, { "m2m:sgn": { vrq: true, cr: ADMIN, sur: subSid } });
+});
+
+test("failed HTTP URL verification refuses creation without persisting a subscription", async (t) => {
+  const { startServer, freePort } = require("./helpers/server");
+  const { create, retrieve, CSE_BASE, uniqueRn } = require("./helpers/onem2m");
+  const srv = await startServer({ cse: { subscription_verification: true, notification_timeout_seconds: 0.15 } });
+  t.after(() => srv.stop());
+  const cntSid = `${CSE_BASE}/${uniqueRn("c")}`;
+  const madeCnt = await create(srv.baseUrl, CSE_BASE, 3, { "m2m:cnt": { rn: cntSid.split("/").pop() } });
+  assert.equal(madeCnt.rsc, "2001", madeCnt.raw);
+  for (const [name, rsc, options] of [
+    ["refusal", 4103, { statusCode: 403 }],
+    ["missing response code", undefined, {}],
+    ["timeout", 2000, { reply: false }],
+    ["connection refused", undefined, null],
+  ]) {
+    await t.test(name, async () => {
+      const sink = options ? await startRscSink(rsc, options) : null;
+      try {
+        const url = sink ? sink.url : `http://127.0.0.1:${await freePort()}/noti`;
+        const subSid = `${cntSid}/${uniqueRn("s")}`;
+        const madeSub = await create(srv.baseUrl, cntSid, 23, { "m2m:sub": {
+          rn: subSid.split("/").pop(), nu: [url], enc: { net: [3] }, nct: 1,
+        } });
+        assert.equal(madeSub.rsc, "5204", madeSub.raw);
+        assert.equal((await retrieve(srv.baseUrl, subSid)).rsc, "4004",
+          "a failed verification must leave no subscription");
+        if (sink) assert.equal(sink.received.length, 1);
+      } finally {
+        if (sink) await sink.stop();
+      }
+    });
+  }
+});
+
+test("every target in a mixed URL and resource-ID subscription must verify successfully", async () => {
+  const { startServer } = require("./helpers/server");
+  const { create, retrieve, CSE_BASE, uniqueRn } = require("./helpers/onem2m");
+  const srv = await startServer({ cse: { subscription_verification: true } });
+  const accepted = await startRscSink(2000);
+  const refused = await startRscSink(4103);
+  try {
+    const target = await aeWithPoa(srv.baseUrl, [accepted.url]);
+    const cntSid = `${CSE_BASE}/${uniqueRn("c")}`;
+    const madeCnt = await create(srv.baseUrl, CSE_BASE, 3, { "m2m:cnt": { rn: cntSid.split("/").pop() } });
+    assert.equal(madeCnt.rsc, "2001", madeCnt.raw);
+    const subSid = `${cntSid}/${uniqueRn("s")}`;
+    const madeSub = await create(srv.baseUrl, cntSid, 23, { "m2m:sub": {
+      rn: subSid.split("/").pop(), nu: [accepted.url, target.sid, refused.url], enc: { net: [3] }, nct: 1,
+    } });
+    assert.equal(madeSub.rsc, "5204", madeSub.raw);
+    assert.equal(accepted.received.length, 2, "both direct URL and resource-ID targets are contacted");
+    assert.equal(refused.received.length, 1);
+    assert.equal((await retrieve(srv.baseUrl, subSid)).rsc, "4004");
+  } finally {
+    await accepted.stop();
+    await refused.stop();
+    await srv.stop();
+  }
+});
+
+test("HTTP URL subscriptions skip verification when the setting is off", async () => {
+  const { startServer } = require("./helpers/server");
+  const { create, CSE_BASE, uniqueRn } = require("./helpers/onem2m");
+  const srv = await startServer({ cse: { subscription_verification: false } });
+  const sink = await startRscSink(4103);
+  try {
+    const cntSid = `${CSE_BASE}/${uniqueRn("c")}`;
+    const madeCnt = await create(srv.baseUrl, CSE_BASE, 3, { "m2m:cnt": { rn: cntSid.split("/").pop() } });
+    assert.equal(madeCnt.rsc, "2001", madeCnt.raw);
+    const madeSub = await create(srv.baseUrl, cntSid, 23, { "m2m:sub": {
+      rn: uniqueRn("s"), nu: [sink.url], enc: { net: [3] }, nct: 1,
+    } });
+    assert.equal(madeSub.rsc, "2001", madeSub.raw);
+    assert.equal(sink.received.length, 0, "the disabled feature must not contact the target");
+  } finally {
+    await sink.stop();
     await srv.stop();
   }
 });

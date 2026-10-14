@@ -5,10 +5,8 @@
 // oneM2M-compliant resource-IDs, the Hosting CSE may send a Subscription Verification request
 // primitive to each of them as described in clause 7.5.1.2.3."
 //
-// It is "may", not "shall" -- so this is off by default and turned on for conformance testing.
-// See the design document for why: turning it on makes a subscription creation that used to
-// succeed fail whenever the notification target does not answer, and that target belongs to
-// somebody else's deployment.
+// Verification is off by default. When enabled, it also verifies HTTP(S) notification URLs;
+// an unreachable target or a response other than OK prevents subscription creation.
 const config = require("config");
 
 // The same rule cse/noti.js uses to decide whether an nu entry needs a poa lookup, which is
@@ -27,6 +25,10 @@ const URL_SCHEMES = ["http", "mqtt"];
 function is_resource_id_target(nu_entry) {
     if (typeof nu_entry !== "string") return false;
     return !URL_SCHEMES.some((scheme) => nu_entry.startsWith(scheme + "://") || nu_entry.startsWith(scheme));
+}
+
+function is_url_target(nu_entry) {
+    return typeof nu_entry === "string" && /^https?:\/\//.test(nu_entry);
 }
 
 // Two entries can name the same entity in different spellings -- "/Mobius4/Mobius/ae1" and
@@ -93,15 +95,19 @@ async function same_resource(a_relative, b_relative) {
     return a_ri !== null && b_ri !== null && a_ri === b_ri;
 }
 
-// The notificationURI entries that need a verification request: resource-ID form, and not the
-// Originator (TS-0004:7.4.8.2.1 Recv-6.4).
+// Verify HTTP(S) URLs directly, and resource IDs other than the Originator
+// (TS-0004:7.4.8.2.1 Recv-6.4). MQTT URLs have no verification transport here.
 async function verification_targets(nu_list, originator) {
-    const candidates = (nu_list || []).filter(is_resource_id_target);
+    const candidates = (nu_list || []).filter((nu) => is_url_target(nu) || is_resource_id_target(nu));
     if (candidates.length === 0) return [];
 
     const own = cse_relative(originator);
     const targets = [];
     for (const nu of candidates) {
+        if (is_url_target(nu)) {
+            targets.push(nu);
+            continue;
+        }
         const relative = cse_relative(nu);
         if (relative === own) continue;         // the same name, whichever way it is spelled
 
@@ -123,7 +129,8 @@ async function verification_targets(nu_list, originator) {
 }
 
 function verification_enabled() {
-    return config.cse.subscription_verification === true;
+    return config.cse.subscription_verification === true ||
+        process.env.SUBSCRIPTION_VERIFICATION === "true";
 }
 
 // TS-0004:7.5.1.2.3, receiver side: "The Receiver shall check if the creator of the
@@ -184,8 +191,7 @@ async function handle_verification(req_prim, resp_prim) {
 
 // TS-0004:7.5.1.2.3, sender side: set verificationRequest to true and creator to the Originator
 // ID of the subscription creation request, with To set to the notificationURI; the primitive is
-// duplicated per entry. sur is deliberately absent -- the clause does not ask for it and the
-// <subscription> does not exist yet.
+// duplicated per entry. subscriptionReference names the subscription about to be created.
 //
 // Recv-6.4 gives two failure paths and one status code for both: if the request cannot be sent,
 // SUBSCRIPTION_VERIFICATION_INITIATION_FAILED; if it was sent and any response is not "OK",
@@ -199,12 +205,13 @@ async function verify_targets(nu_list, originator, sub_sid) {
     const enums = require("../config/enums");
     const logger = require("../logger");
     const config_mod = require("config");
-    const { send_verification } = require("./noti");
+    const { send_verification, send_verification_url } = require("./noti");
 
     for (const target of targets) {
         let rsc;
         try {
-            rsc = await send_verification(target, originator, sub_sid,
+            const send = is_url_target(target) ? send_verification_url : send_verification;
+            rsc = await send(target, originator, sub_sid,
                 config_mod.cse.notification_timeout_seconds * 1000);
         } catch (err) {
             logger.info({ target, err: err.message }, "subscription verification could not be sent");
@@ -226,6 +233,7 @@ async function verify_targets(nu_list, originator, sub_sid) {
 
 module.exports = {
     is_resource_id_target,
+    is_url_target,
     cse_relative,
     verification_targets,
     verification_enabled,

@@ -110,3 +110,12 @@ test("settings unrelated to registration are unaffected", () => {
   // Containers always log to stdout — this one is not driven by an environment variable.
   assert.equal(cfg.logging.file.enabled, false);
 });
+
+test("subscription verification can be enabled or disabled through the container environment", () => {
+  assert.equal(build({ SUBSCRIPTION_VERIFICATION: "true" }).cse.subscription_verification, true);
+  assert.equal(build({ SUBSCRIPTION_VERIFICATION: "false" }).cse.subscription_verification, false);
+  for (const vars of [{}, { SUBSCRIPTION_VERIFICATION: "" }]) {
+    assert.equal("subscription_verification" in build(vars).cse, false,
+      "an unset variable must preserve the configuration default");
+  }
+});
