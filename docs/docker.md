@@ -50,7 +50,7 @@ default** rather than being overridden with an empty value, so `.env` only needs
 settings you actually want to change.
 
 The full list of keys and what they do is in [.env.example](../.env.example); the
-underlying settings are in [configuration.md](configuration.md). Two are worth
+underlying settings are in [configuration.md](configuration.md). Several are worth
 calling out here, and one thing is configured outside `.env` entirely.
 
 **`CSE_POA`** — the address this CSE advertises about itself, used by other CSEs and
@@ -61,6 +61,13 @@ an address that resolves from outside the container.
 **`HELMET_ENABLED` and `RATELIMIT_ENABLED`** default to `true` here and to `false` in
 `config/default.json`. The defaults there suit a developer running from source. Turn
 them off only if something in front of Mobius4 is doing the same job.
+
+**`SUBSCRIPTION_VERIFICATION=true`** enables verification before creating subscriptions, including
+those with plain HTTP/HTTPS notification URLs. Every verification target must return
+`X-M2M-RSC: 2000`; refusal, a missing response code, or a timeout fails creation with `5204`.
+It is off by default. After changing `.env`, recreate the CSE container with
+`docker compose up -d --build mobius4`. See
+[Turning on subscription verification](how-to.md#turning-on-subscription-verification).
 
 **`<flexContainer>` specializations** are not an `.env` setting. The registry the CSE reads
 at startup, `config/specializations.json`, is generated from `config/specializations.manifest.json`

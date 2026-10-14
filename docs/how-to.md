@@ -617,7 +617,11 @@ refuses the creation unless it answers.
 {"cse": {"subscription_verification": true}}
 ```
 
-in `config/local.json`, then restart. It is off in `config/default.json` because
+in `config/local.json`, then restart. Alternatively, set `SUBSCRIPTION_VERIFICATION=true` in
+the process environment. For Docker Compose, put that variable in `.env` and recreate the CSE
+container with `docker compose up -d --build mobius4`; the image does not include `config/local.json`.
+
+It is off in `config/default.json` because
 `TS-0004:7.4.8.2.1` Recv-6.4 says the Hosting CSE **may** do this, not shall — it is a deployment
 choice, not a conformance requirement. Turn it on to run the oneM2M conformance tests that depend
 on it; leave it off if notification targets in your deployment are not reliably reachable, because
@@ -625,37 +629,41 @@ an unreachable one now fails subscription creation instead of merely missing not
 
 ### What it applies to
 
-Only `notificationURI` entries that are **oneM2M resource IDs and are not the Originator**. The
-clause scopes it that way, and `TS-0001:9.6.8` gives the same split a reason: the CSE "shall expect
-to receive a response for the notification request only if the Notification Target ... is in the
-oneM2M compliant Resource-ID format". A plain URL target cannot answer, so it cannot be verified.
+Verification applies to **HTTP/HTTPS notification URLs** and **oneM2M resource IDs that are not
+the Originator**. Resource-ID verification follows `TS-0004:7.4.8.2.1` Recv-6.4. HTTP/HTTPS URLs
+are verified directly: the CSE posts to the URL exactly as supplied, including its path and query,
+and requires an `X-M2M-RSC: 2000` response. MQTT URLs are not verified.
 
 ```
 nu: ["Mobius/ae1"]                    verified
 nu: ["/Mobius4/Mobius/ae1"]           verified (same AE, SP-relative spelling)
-nu: ["http://host/notify"]            not verified — a URL, unchanged behaviour
+nu: ["http://host/notify"]            verified directly
+nu: ["https://host/notify"]           verified directly over TLS
+nu: ["mqtt://broker/topic"]           not verified
 nu: [<the Originator itself>]         not verified — the clause excludes it
 ```
 
-A subscription with no resource-ID target behaves exactly as it did before, whether the setting is
-on or off.
+When verification is disabled, subscription creation does not contact notification targets.
 
 ### What the creation answers when verification fails
 
 `5204` SUBSCRIPTION_VERIFICATION_INITIATION_FAILED, for both failures `TS-0004:7.4.8.2.1` Recv-6.4
 distinguishes: the request could not be sent at all, or it was sent and the target answered
-something other than 2000. The `<subscription>` is not created — verification runs before the
-insert, so there is no partially-created resource to clean up.
+something other than 2000. A missing `X-M2M-RSC` header also fails verification. The
+`<subscription>` is not created — verification runs before the insert, so there is no
+partially-created resource to clean up.
 
-The verification NOTIFY is dialled at the target `<AE>`'s `pointOfAccess`, and only `http` entries
-are tried. An `<AE>` reachable only over MQTT therefore cannot be verified, and a subscription
-naming it is refused 5204. It carries `verificationRequest`, `creator`, and
+For resource-ID targets, the verification NOTIFY is dialled at the target `<AE>`'s `pointOfAccess`,
+and only HTTP/HTTPS entries are tried. An `<AE>` reachable only over MQTT therefore cannot be
+verified, and a subscription naming it is refused 5204. Direct HTTP/HTTPS URLs need no
+`pointOfAccess` lookup. Both forms carry `verificationRequest`, `creator`, and
 `subscriptionReference` naming the `<subscription>` about to be created — that last one is
 mandatory on every notification (`TS-0004` table 6.3.5.13-1) even though the verification procedure
 clause does not mention it. It carries no `notificationEvent`, and therefore no
 `notificationEventType`: the same table says `net` "shall only be present if the notificationEvent
 parent element is present, otherwise it shall not", and a verification request reports no event.
-The timeout is `cse.notification_timeout_seconds`.
+The headers carry the hosting CSE's ID as `X-M2M-Origin`, a fresh `X-M2M-RI`, and its configured
+release version as `X-M2M-RVI`. The timeout is `cse.notification_timeout_seconds`.
 
 ### Being a verification target
 

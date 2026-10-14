@@ -89,6 +89,7 @@ services:
       CSE_SP_ID: ${CSE_SP_ID:-}
       CSE_BASE_RN: ${CSE_BASE_RN:-}
       CSE_POA: ${CSE_POA:-}
+      SUBSCRIPTION_VERIFICATION: ${SUBSCRIPTION_VERIFICATION:-}
       # Registration with another CSE. Leave all of these unset for a standalone IN-CSE, which
       # is what an unconfigured deployment is. See docs/docker.md for a two-CSE example.
       CSE_TYPE: ${CSE_TYPE:-}
